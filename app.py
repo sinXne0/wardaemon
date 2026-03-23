@@ -31,7 +31,10 @@ from modules.pi_display import create_display
 from modules.wigle_export import (
     export_to_csv, export_to_csv_string, export_to_kml, WiGLEUploader
 )
+from modules import scan_db, oui as oui_lookup
 import config as cfg
+
+scan_db.init()
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 log_handlers = [logging.StreamHandler()]
@@ -88,11 +91,17 @@ state = {
     "wigle_user":         "",         # display name / username
     "wigle_credential":   "",         # base64 encoded credential for API
     "session_start":      None,
+    "session_name":       "",         # user-defined session label
     "interface":          None,
     "tcp_nmea_active":    False,
     "phone_gps_active":   False,
     "bt_scanning":        False,
+    "auto_upload":        False,      # upload to WiGLE when scan stops
+    "delete_after_upload": False,     # clear data after successful upload
 }
+
+# Session tracking
+_current_session_id: int | None = None
 
 # ── Persistent WiGLE credentials ─────────────────────────────────────────────
 def _load_creds():
@@ -134,21 +143,68 @@ _display = create_display(cfg) if cfg.IS_PI else None
 # ── Network store (unified for both Linux scanner & T-Pager) ─────────────────
 _networks: dict[str, dict] = {}
 _net_lock = threading.Lock()
+_rssi_history: dict[str, list] = {}     # bssid → [rssi, ...]  (last 30 samples)
 
 
 def _store_network(net: dict, is_new: bool):
-    """Thread-safe network upsert."""
+    """Thread-safe network upsert with OUI lookup, evil-twin detection, RSSI history, and DB persistence."""
     bssid = net.get("bssid", "")
     if not bssid:
         return
+
+    # OUI manufacturer lookup on first sight
+    if not net.get("manufacturer"):
+        net["manufacturer"] = oui_lookup.lookup(bssid)
+
     with _net_lock:
         if bssid not in _networks:
-            _networks[bssid] = net
-            _networks[bssid]["is_new"] = True
+            net["is_new"]     = True
+            net["evil_twin"]  = False
+            _networks[bssid]  = net
+            _rssi_history[bssid] = [net.get("rssi", -100)]
+
+            # Evil twin detection: same SSID, different BSSID with differing security
+            ssid = (net.get("ssid") or "").strip()
+            if ssid:
+                for existing_bssid, existing in _networks.items():
+                    if existing_bssid == bssid:
+                        continue
+                    if (existing.get("ssid") or "").strip() == ssid:
+                        same_auth = existing.get("auth_mode", "") == net.get("auth_mode", "")
+                        if not same_auth:
+                            net["evil_twin"] = True
+                            _networks[bssid]["evil_twin"] = True
+                            existing["evil_twin"] = True
+                            try:
+                                scan_db.mark_evil_twin(bssid)
+                                scan_db.mark_evil_twin(existing_bssid)
+                            except Exception:
+                                pass
+                            socketio.emit("evil_twin", {
+                                "bssid": bssid, "ssid": ssid,
+                                "auth": net.get("auth_mode", ""),
+                                "conflict_bssid": existing_bssid,
+                                "conflict_auth": existing.get("auth_mode", ""),
+                            })
+                            logger.warning(f"Evil twin detected: {ssid} on {bssid} vs {existing_bssid}")
         else:
-            _networks[bssid]["rssi"]      = net.get("rssi", _networks[bssid]["rssi"])
-            _networks[bssid]["last_seen"] = net.get("last_seen", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
-            _networks[bssid]["is_new"]    = False
+            _networks[bssid]["rssi"]         = net.get("rssi", _networks[bssid].get("rssi", -100))
+            _networks[bssid]["last_seen"]     = net.get("last_seen", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+            _networks[bssid]["is_new"]        = False
+            if net.get("lat"):
+                _networks[bssid]["lat"] = net["lat"]
+                _networks[bssid]["lon"] = net["lon"]
+            # Update RSSI history
+            hist = _rssi_history.setdefault(bssid, [])
+            hist.append(net.get("rssi", -100))
+            if len(hist) > 30:
+                hist.pop(0)
+
+    # Persist to SQLite
+    try:
+        scan_db.upsert(net, session_id=_current_session_id)
+    except Exception as e:
+        logger.debug(f"DB upsert failed: {e}")
 
 
 def _get_all_networks() -> list[dict]:
@@ -167,22 +223,41 @@ def _get_stats() -> dict:
     ble        = sum(1 for n in nets if n.get("type") == "BLE")
     bt_classic = sum(1 for n in nets if n.get("type") == "BT")
     tpager_src = sum(1 for n in nets if n.get("source") == "tpager")
+    evil_twins = sum(1 for n in nets if n.get("evil_twin"))
+    # Channel usage histogram (WiFi only, channels 1–14 = 2.4 GHz, others = 5 GHz bucket)
+    channels: dict[str, int] = {}
+    for n in nets:
+        if n.get("type") != "WIFI":
+            continue
+        ch = int(n.get("channel") or 0)
+        if 1 <= ch <= 14:
+            key = str(ch)
+        elif ch > 14:
+            key = "5G"
+        else:
+            continue
+        channels[key] = channels.get(key, 0) + 1
     return {
         "total": total, "open": open_, "wpa2": wpa2,
         "wpa3": wpa3, "wpa": wpa, "wep": wep,
         "ble": ble, "bt_classic": bt_classic,
-        "tpager": tpager_src,
+        "tpager": tpager_src, "evil_twins": evil_twins,
+        "channels": channels,
+        "db_total": scan_db.total_unique(),
     }
 
 
 def _push_update(new_bssids: list = None):
     """Emit current network state to all WebSocket clients."""
     fix = gps.get_fix()
+    with _net_lock:
+        hist_snapshot = {b: list(h) for b, h in _rssi_history.items()}
     socketio.emit("networks_update", {
-        "networks": _get_all_networks(),
-        "stats":    _get_stats(),
-        "gps":      fix.to_dict(),
-        "new_bssids": new_bssids or [],
+        "networks":     _get_all_networks(),
+        "stats":        _get_stats(),
+        "gps":          fix.to_dict(),
+        "new_bssids":   new_bssids or [],
+        "rssi_history": hist_snapshot,
     })
 
 
@@ -300,26 +375,63 @@ def index():
 # ── Linux Scan Control ──────────────────────────────────────────────────────
 @app.route("/api/scan/start", methods=["POST"])
 def start_scan():
+    global _current_session_id
     if state["scanning"] and state["scan_source"] == "linux":
         return jsonify({"success": False, "error": "Already scanning"})
     data      = request.json or {}
     interface = data.get("interface") or None
     interval  = float(data.get("interval", 5.0))
+    name      = (data.get("session_name") or "").strip()
     scanner.interval = interval
     scanner.start(interface=interface)
-    state["scanning"]     = True
-    state["scan_source"]  = "linux"
+    state["scanning"]      = True
+    state["scan_source"]   = "linux"
     state["session_start"] = datetime.utcnow().isoformat()
-    state["interface"]    = interface
-    return jsonify({"success": True, "interface": interface, "interval": interval})
+    state["session_name"]  = name
+    state["interface"]     = interface
+    try:
+        _current_session_id = scan_db.start_session(name)
+    except Exception as e:
+        logger.warning(f"Could not create session: {e}")
+    return jsonify({"success": True, "interface": interface, "interval": interval,
+                    "session_id": _current_session_id})
 
 
 @app.route("/api/scan/stop", methods=["POST"])
 def stop_scan():
+    global _current_session_id
     scanner.stop()
+    total = _get_stats()["total"]
+    if _current_session_id:
+        try:
+            scan_db.end_session(_current_session_id, total)
+        except Exception:
+            pass
+        _current_session_id = None
     state["scanning"]    = False
     state["scan_source"] = "none"
-    return jsonify({"success": True, "total": _get_stats()["total"]})
+
+    # Auto-upload to WiGLE if enabled
+    if state.get("auto_upload") and state.get("wigle_credential"):
+        try:
+            uploader = WiGLEUploader(state["wigle_credential"])
+            networks = _get_all_networks()
+            if networks:
+                csv_data = export_to_csv_string(networks)
+                ts       = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                result   = uploader.upload_string(csv_data, filename=f"wardaemon_{ts}.csv",
+                                                  donate=False)
+                if result.get("success") and state.get("delete_after_upload"):
+                    with _net_lock:
+                        _networks.clear()
+                        _rssi_history.clear()
+                    scanner.clear()
+                    _push_update()
+                logger.info(f"Auto-upload result: {result}")
+        except Exception as e:
+            logger.warning(f"Auto-upload failed: {e}")
+
+    return jsonify({"success": True, "total": total})
 
 
 @app.route("/api/scan/clear", methods=["POST"])
@@ -441,6 +553,37 @@ def list_interfaces_route():
     return jsonify({"interfaces": get_wifi_interfaces()})
 
 
+@app.route("/api/networks/detail/<bssid>")
+def network_detail(bssid):
+    """Return persistent DB record + live RSSI history for a network."""
+    db_rec = scan_db.get_network(bssid)
+    with _net_lock:
+        live   = _networks.get(bssid.upper(), {})
+        hist   = list(_rssi_history.get(bssid.upper(), []))
+    return jsonify({"db": db_rec, "live": live, "rssi_history": hist})
+
+
+@app.route("/api/sessions")
+def get_sessions():
+    return jsonify({"sessions": scan_db.get_sessions()})
+
+
+@app.route("/manifest.json")
+def pwa_manifest():
+    return jsonify({
+        "name": "WARDAEMON",
+        "short_name": "WARDAEMON",
+        "start_url": "/phone",
+        "display": "standalone",
+        "background_color": "#0a0e1a",
+        "theme_color": "#00d4ff",
+        "icons": [
+            {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png"},
+        ],
+    })
+
+
 # ── Bluetooth Routes ──────────────────────────────────────────────────────────
 @app.route("/api/bt/start", methods=["POST"])
 def bt_start():
@@ -559,14 +702,33 @@ def wigle_upload():
         return jsonify({"success": False, "error": "Not logged in to WiGLE"})
     data     = request.json or {}
     donate   = data.get("donate", False)
+    delete   = data.get("delete_after", False)
     networks = _get_all_networks()
     if not networks:
         return jsonify({"success": False, "error": "No networks to upload"})
     csv_data = export_to_csv_string(networks)
-    filename = f"wardriver_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    filename = f"wardaemon_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
     result   = uploader.upload_string(csv_data, filename=filename, donate=donate)
     result["network_count"] = len(networks)
+    if result.get("success") and delete:
+        with _net_lock:
+            _networks.clear()
+            _rssi_history.clear()
+        scanner.clear()
+        _push_update()
+        result["cleared"] = True
     return jsonify(result)
+
+
+@app.route("/api/wigle/settings", methods=["POST"])
+def wigle_settings():
+    data = request.json or {}
+    if "auto_upload" in data:
+        state["auto_upload"] = bool(data["auto_upload"])
+    if "delete_after_upload" in data:
+        state["delete_after_upload"] = bool(data["delete_after_upload"])
+    return jsonify({"success": True, "auto_upload": state["auto_upload"],
+                    "delete_after_upload": state["delete_after_upload"]})
 
 
 @app.route("/api/wigle/search", methods=["POST"])
@@ -698,16 +860,22 @@ def handle_phone_gps(data):
 @socketio.on("connect")
 def on_connect():
     fix = gps.get_fix()
+    with _net_lock:
+        hist_snapshot = {b: list(h) for b, h in _rssi_history.items()}
     emit("init", {
-        "networks":         _get_all_networks(),
-        "stats":            _get_stats(),
-        "gps":              fix.to_dict(),
-        "scanning":         state["scanning"],
-        "scan_source":      state["scan_source"],
-        "gps_mode":         gps.get_mode(),
-        "tpager_connected": state["tpager_connected"],
-        "bt_scanning":      state["bt_scanning"],
-        "bt_stats":         bt_scanner.get_stats(),
+        "networks":            _get_all_networks(),
+        "stats":               _get_stats(),
+        "gps":                 fix.to_dict(),
+        "scanning":            state["scanning"],
+        "scan_source":         state["scan_source"],
+        "session_name":        state["session_name"],
+        "gps_mode":            gps.get_mode(),
+        "tpager_connected":    state["tpager_connected"],
+        "bt_scanning":         state["bt_scanning"],
+        "bt_stats":            bt_scanner.get_stats(),
+        "auto_upload":         state["auto_upload"],
+        "delete_after_upload": state["delete_after_upload"],
+        "rssi_history":        hist_snapshot,
     })
 
 

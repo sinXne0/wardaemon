@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>WARDAEMON — WiGLE Wardriving</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"/>
   <style>
     :root {
       --bg: #0a0e1a; --bg2: #111827; --bg3: #1c2333;
@@ -165,7 +168,7 @@
 
 <!-- ─── Header ─── -->
 <div class="header">
-  <div class="logo">WARD<span>RIVER</span>PY</div>
+  <div class="logo">WARD<span>AEMON</span></div>
   <div class="status-bar">
     <div class="badge" id="badge-scan" class="red">
       <span class="dot red" id="dot-scan"></span>
@@ -197,6 +200,10 @@
         ▶ Scanner Control <span id="scan-status-txt" style="color:var(--red)">IDLE</span>
       </div>
       <div class="panel-body">
+        <div class="form-row">
+          <label>Session Name</label>
+          <input type="text" id="session-name" placeholder="e.g. Downtown run" autocomplete="off"/>
+        </div>
         <div class="form-row">
           <label>WiFi Interface</label>
           <select id="iface-select">
@@ -358,6 +365,14 @@
           <div class="stat-box purple"><div class="val" id="stat-wpa3">0</div><div class="lbl">WPA3</div></div>
           <div class="stat-box yellow"><div class="val" id="stat-wpa">0</div><div class="lbl">WPA</div></div>
           <div class="stat-box orange"><div class="val" id="stat-wep">0</div><div class="lbl">WEP</div></div>
+          <div class="stat-box" style="border-color:var(--purple)">
+            <div class="stat-val" id="stat-db" style="color:var(--purple)">0</div>
+            <div class="stat-lbl">ALL TIME</div>
+          </div>
+        </div>
+        <div style="margin-top:12px">
+          <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:6px">Channel Usage</div>
+          <div id="channel-chart" style="display:flex;align-items:flex-end;gap:2px;height:40px;padding:0 2px"></div>
         </div>
       </div>
     </div>
@@ -400,6 +415,16 @@
             <button class="btn btn-primary" onclick="wigleUpload()">UPLOAD TO WIGLE</button>
           </div>
           <div id="wigle-upload-result"></div>
+          <div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px">
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:11px;margin-bottom:6px">
+              <input type="checkbox" id="wigle-auto-upload" onchange="saveWiGLESettings()"/>
+              Auto-upload when scan stops
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:11px">
+              <input type="checkbox" id="wigle-delete-after" onchange="saveWiGLESettings()"/>
+              Delete data after upload
+            </label>
+          </div>
         </div>
       </div>
     </div>
@@ -427,7 +452,10 @@
     </div>
 
     <!-- Map Tab -->
-    <div class="tab-pane active" id="tab-map">
+    <div class="tab-pane active" id="tab-map" style="position:relative">
+      <div style="position:absolute;top:8px;right:8px;z-index:1000">
+        <button id="btn-heatmap" class="btn btn-dark" onclick="toggleHeatmap()" style="font-size:11px;padding:4px 10px">HEATMAP</button>
+      </div>
       <div id="map"></div>
     </div>
 
@@ -449,6 +477,7 @@
           <thead>
             <tr>
               <th>SSID</th>
+              <th>Vendor</th>
               <th>BSSID</th>
               <th>Security</th>
               <th>Ch</th>
@@ -495,8 +524,20 @@
 <!-- ─── Toast ─── -->
 <div id="toast"></div>
 
+<!-- Network Detail Panel -->
+<div id="detail-panel" style="position:fixed;top:0;right:-380px;width:360px;height:100vh;background:var(--bg2);border-left:1px solid var(--border);z-index:2000;transition:right .25s ease;overflow-y:auto;padding:20px">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+    <span style="font-size:13px;font-weight:600;color:var(--text)">Network Detail</span>
+    <button onclick="closeDetail()" style="background:none;border:none;color:var(--muted);font-size:18px;cursor:pointer">✕</button>
+  </div>
+  <div id="detail-content"></div>
+</div>
+<div id="detail-overlay" onclick="closeDetail()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:1999"></div>
+
 <!-- ─── Scripts ─── -->
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+<script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script>
 // ── State ─────────────────────────────────────────────────────────────────
@@ -504,6 +545,7 @@ let networks = {};      // bssid → net object
 let gpsPos   = null;
 let scanning = false;
 let tpagerOk = false;
+let rssiHistory = {};
 
 // ── Map Setup ─────────────────────────────────────────────────────────────
 const map = L.map('map').setView([20, 0], 3);
@@ -511,6 +553,10 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '© OpenStreetMap',
   className: 'map-tiles'
 }).addTo(map);
+const clusterGroup = L.markerClusterGroup({ maxClusterRadius: 60, spiderfyOnMaxZoom: true });
+map.addLayer(clusterGroup);
+let heatLayer = null;
+let showHeatmap = false;
 
 // Dark map tiles via CSS
 const style = document.createElement('style');
@@ -546,8 +592,8 @@ function addMapMarker(net) {
     markers[net.bssid].setLatLng([net.lat, net.lon]);
   } else {
     const m = L.marker([net.lat, net.lon], {icon})
-      .bindPopup(`<b>${escHtml(net.ssid)}</b><br>${net.bssid}<br>${net.auth_mode}<br>Ch ${net.channel} | ${net.rssi} dBm`)
-      .addTo(map);
+      .bindPopup(`<b>${escHtml(net.ssid)}</b><br>${net.bssid}<br>${net.auth_mode}<br>Ch ${net.channel} | ${net.rssi} dBm`);
+    clusterGroup.addLayer(m);
     markers[net.bssid] = m;
   }
 }
@@ -563,6 +609,10 @@ socket.on('init', (data) => {
   if (data.gps) updateGPSDisplay(data.gps);
   renderTable();
   setScanning(data.scanning, data.scan_source);
+  if (data.auto_upload !== undefined) document.getElementById('wigle-auto-upload').checked = data.auto_upload;
+  if (data.delete_after_upload !== undefined) document.getElementById('wigle-delete-after').checked = data.delete_after_upload;
+  if (data.rssi_history) rssiHistory = data.rssi_history;
+  if (data.session_name) document.getElementById('session-name').value = data.session_name;
 });
 
 socket.on('networks_update', (data) => {
@@ -577,6 +627,7 @@ socket.on('networks_update', (data) => {
   }
   updateStats(data.stats);
   if (data.gps) updateGPSDisplay(data.gps);
+  if (data.rssi_history) rssiHistory = data.rssi_history;
   if (changed) renderTable();
 });
 
@@ -611,6 +662,20 @@ function updateStats(s) {
   document.getElementById('stat-wpa').textContent   = s.wpa   || 0;
   document.getElementById('stat-wep').textContent   = s.wep   || 0;
   document.getElementById('hdr-total').textContent  = t;
+  document.getElementById('stat-db').textContent = (s.db_total || 0).toLocaleString();
+  // Channel chart
+  const ch = s.channels || {};
+  const chEl = document.getElementById('channel-chart');
+  if (chEl && Object.keys(ch).length > 0) {
+    const max = Math.max(...Object.values(ch), 1);
+    const keys = ['1','2','3','4','5','6','7','8','9','10','11','12','13','14','5G'];
+    chEl.innerHTML = keys.map(k => {
+      const v = ch[k] || 0;
+      const h = Math.round((v / max) * 36) + 4;
+      const color = k === '5G' ? 'var(--purple)' : (v > 0 ? 'var(--accent)' : 'var(--border)');
+      return `<div title="Ch ${k}: ${v}" style="flex:1;height:${h}px;background:${color};border-radius:2px 2px 0 0;min-width:4px"></div>`;
+    }).join('');
+  }
 }
 
 function updateGPSDisplay(fix) {
@@ -707,8 +772,11 @@ function renderTable() {
     const src = n.source === 'tpager'
       ? '<span class="src-badge src-tpager">T-Pager</span>'
       : '<span class="src-badge src-linux">Linux</span>';
-    return `<tr id="row-${n.bssid.replace(/:/g,'')}" onclick="focusNet(${JSON.stringify(n.lat)},${JSON.stringify(n.lon)})">
-      <td class="ssid" title="${escHtml(n.ssid)}">${escHtml(n.ssid)}</td>
+    const evilTwin = n.evil_twin ? '<span style="color:var(--red);font-size:9px;margin-left:4px" title="Possible evil twin">⚠</span>' : '';
+    const vendor = escHtml((n.manufacturer || '').slice(0, 12));
+    return `<tr id="row-${n.bssid.replace(/:/g,'')}" style="cursor:pointer" onclick="showDetail('${escHtml(n.bssid)}')">
+      <td class="ssid" title="${escHtml(n.ssid)}">${escHtml(n.ssid)}${evilTwin}</td>
+      <td style="font-size:10px;color:var(--muted)">${vendor}</td>
       <td style="font-family:monospace;font-size:10px">${n.bssid}</td>
       <td>${secBadge(n.auth_mode)}</td>
       <td>${n.channel||'-'}</td>
@@ -771,7 +839,8 @@ async function api(method, url, body) {
 async function startScan() {
   const iface    = document.getElementById('iface-select').value;
   const interval = parseFloat(document.getElementById('scan-interval').value);
-  const r = await api('POST', '/api/scan/start', {interface: iface||null, interval});
+  const session_name = document.getElementById('session-name').value.trim();
+  const r = await api('POST', '/api/scan/start', {interface: iface||null, interval, session_name});
   if (r.success) { setScanning(true, 'linux'); toast('Scanning started', 'ok'); }
   else toast('Error: ' + r.error, 'err');
 }
@@ -890,9 +959,10 @@ async function wigleLogout() {
 
 async function wigleUpload() {
   const donate = document.getElementById('wigle-donate').checked;
+  const delete_after = document.getElementById('wigle-delete-after').checked;
   const el     = document.getElementById('wigle-upload-result');
   el.innerHTML = '<span class="spinner"></span> Uploading...';
-  const r = await api('POST', '/api/wigle/upload', {donate});
+  const r = await api('POST', '/api/wigle/upload', {donate, delete_after});
   if (r.success) {
     el.innerHTML = `<div class="wigle-result wigle-ok">✓ ${r.message}<br>${r.network_count} networks uploaded</div>`;
     toast('Upload successful!', 'ok');
@@ -1018,6 +1088,80 @@ function toast(msg, type='info') {
   el.style.display = 'block';
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.style.display = 'none', 3500);
+}
+
+// ── WiGLE Settings ─────────────────────────────────────────────────────────
+async function saveWiGLESettings() {
+  const auto = document.getElementById('wigle-auto-upload').checked;
+  const del  = document.getElementById('wigle-delete-after').checked;
+  await api('POST', '/api/wigle/settings', {auto_upload: auto, delete_after_upload: del});
+}
+
+// ── Heatmap ────────────────────────────────────────────────────────────────
+function toggleHeatmap() {
+  showHeatmap = !showHeatmap;
+  if (showHeatmap) {
+    const pts = Object.values(networks)
+      .filter(n => n.lat && n.lon && n.type === 'WIFI')
+      .map(n => [n.lat, n.lon, Math.max(0, (n.rssi + 100) / 50)]);
+    if (heatLayer) map.removeLayer(heatLayer);
+    heatLayer = L.heatLayer(pts, {radius: 25, blur: 15, maxZoom: 17}).addTo(map);
+    document.getElementById('btn-heatmap').style.background = 'var(--accent)';
+    document.getElementById('btn-heatmap').style.color = '#000';
+  } else {
+    if (heatLayer) { map.removeLayer(heatLayer); heatLayer = null; }
+    document.getElementById('btn-heatmap').style.background = '';
+    document.getElementById('btn-heatmap').style.color = '';
+  }
+}
+
+// ── Network Detail ─────────────────────────────────────────────────────────
+async function showDetail(bssid) {
+  const r = await fetch(`/api/networks/detail/${encodeURIComponent(bssid)}`);
+  const d = await r.json();
+  const n = networks[bssid] || {};
+  const db = d.db || {};
+  const hist = d.rssi_history || rssiHistory[bssid] || [];
+  const histHtml = hist.length > 1 ? `
+    <div style="margin-top:8px">
+      <div style="font-size:10px;color:var(--muted);margin-bottom:4px">RSSI History (${hist.length} samples)</div>
+      <div style="display:flex;align-items:flex-end;gap:1px;height:30px">
+        ${hist.map(v => {
+          const h = Math.round(((v + 100) / 70) * 28) + 2;
+          return `<div style="flex:1;height:${Math.min(30,h)}px;background:var(--accent);border-radius:1px;min-width:3px" title="${v} dBm"></div>`;
+        }).join('')}
+      </div>
+    </div>` : '';
+  document.getElementById('detail-content').innerHTML = `
+    <div style="font-size:15px;font-weight:600;color:var(--text);margin-bottom:12px">${escHtml(n.ssid || db.ssid || '<hidden>')}</div>
+    <table style="width:100%;font-size:12px;border-collapse:collapse">
+      ${[
+        ['BSSID',     bssid],
+        ['Vendor',    n.manufacturer || db.manufacturer || '—'],
+        ['Security',  n.auth_mode || db.auth_mode || '—'],
+        ['Channel',   n.channel || db.channel || '—'],
+        ['RSSI',      `${n.rssi || '—'} dBm`],
+        ['Best RSSI', `${db.best_rssi || '—'} dBm`],
+        ['Sightings', db.sighting_count || 1],
+        ['First Seen',db.first_seen || n.first_seen || '—'],
+        ['Last Seen', db.last_seen || n.last_seen || '—'],
+        ['GPS',       n.lat ? `${(n.lat).toFixed(5)}, ${(n.lon).toFixed(5)}` : '—'],
+        ['Type',      n.type || '—'],
+        ['Evil Twin', n.evil_twin ? '⚠ Suspected' : 'No'],
+      ].map(([k,v]) => `<tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:5px 0;color:var(--muted)">${k}</td>
+        <td style="padding:5px 0;color:var(--text);text-align:right">${escHtml(String(v))}</td>
+      </tr>`).join('')}
+    </table>
+    ${histHtml}
+    ${n.lat ? `<button class="btn btn-dark" style="margin-top:12px;width:100%" onclick="focusNet(${n.lat},${n.lon});closeDetail()">SHOW ON MAP</button>` : ''}
+  `;
+  document.getElementById('detail-panel').style.right = '0';
+  document.getElementById('detail-overlay').style.display = 'block';
+}
+function closeDetail() {
+  document.getElementById('detail-panel').style.right = '-380px';
+  document.getElementById('detail-overlay').style.display = 'none';
 }
 </script>
 </body>

@@ -3,8 +3,11 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no"/>
-  <meta name="theme-color" content="#0a0e1a"/>
+  <meta name="theme-color" content="#00d4ff"/>
   <title>WARDAEMON Mobile</title>
+  <link rel="manifest" href="/manifest.json">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <style>
     :root {
@@ -294,6 +297,16 @@
         </label>
         <button class="wigle-btn upload" onclick="wigleUpload()">UPLOAD TO WIGLE</button>
         <div id="w-upload-result"></div>
+        <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;margin-bottom:8px">
+            <input type="checkbox" id="w-auto-upload" onchange="saveWiGLESettings()"/>
+            Auto-upload on scan stop
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px">
+            <input type="checkbox" id="w-delete-after" onchange="saveWiGLESettings()"/>
+            Delete data after upload
+          </label>
+        </div>
       </div>
 
       <div class="card">
@@ -445,6 +458,8 @@ socket.on('init', d => {
   setBTState(d.bt_scanning||false);
   renderNets();
   loadSettings();
+  if (d.auto_upload !== undefined) document.getElementById('w-auto-upload').checked = d.auto_upload;
+  if (d.delete_after_upload !== undefined) document.getElementById('w-delete-after').checked = d.delete_after_upload;
 });
 
 socket.on('networks_update', d => {
@@ -642,8 +657,11 @@ function renderNets() {
   document.getElementById('net-list').innerHTML = nets.map(n => {
     const sec = secBadge(n.auth_mode, n.type);
     const bars = rssiBars(n.rssi);
+    const evilTwin = n.evil_twin ? '<span style="color:var(--red);font-size:10px;margin-left:4px">⚠</span>' : '';
+    const vendor = n.manufacturer ? `<span style="font-size:10px;color:var(--muted);display:block;margin-top:2px">${esc(n.manufacturer)}</span>` : '';
     return `<div class="net-item" id="ni-${n.bssid.replace(/:/g,'')}" onclick="focusOnMap(${n.lat},${n.lon})">
-      <div class="net-ssid">${esc(n.ssid)}</div>
+      <div class="net-ssid">${esc(n.ssid)}${evilTwin}</div>
+      ${vendor}
       <div class="net-meta">
         ${sec}
         <div class="rssi-dots">${bars}</div>
@@ -738,11 +756,18 @@ async function wigleLogout() {
   toast('Signed out of WiGLE', 'info');
 }
 
+async function saveWiGLESettings() {
+  const auto = document.getElementById('w-auto-upload').checked;
+  const del  = document.getElementById('w-delete-after').checked;
+  await api('POST', '/api/wigle/settings', {auto_upload: auto, delete_after_upload: del});
+}
+
 async function wigleUpload() {
   const donate = document.getElementById('w-donate').checked;
+  const delete_after = document.getElementById('w-delete-after').checked;
   const el     = document.getElementById('w-upload-result');
   el.innerHTML = '<span class="spin"></span> Uploading...';
-  const r = await api('POST', '/api/wigle/upload', {donate});
+  const r = await api('POST', '/api/wigle/upload', {donate, delete_after});
   el.innerHTML = r.success
     ? `<div class="result-box result-ok">✓ ${r.message}<br>${r.network_count} networks</div>`
     : `<div class="result-box result-err">✗ ${r.error}</div>`;

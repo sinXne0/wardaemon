@@ -26,3 +26,4 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+wardaemon.db
